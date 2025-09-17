@@ -8,13 +8,16 @@
 import os
 import re
 import time
+import json
 from datetime import datetime, timedelta
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
+from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
 from dateutil import tz
+from dateutil.parser import isoparse
 from feedgen.feed import FeedGenerator
 from requests.adapters import HTTPAdapter, Retry
 
@@ -34,6 +37,7 @@ VIEW_PREFIX_MAP = {
 
 MAX_ITEMS = 5
 DELAY_TITLE_PAGE = 0.3
+DELAY_DETAIL_PAGE = 0.3
 DELAY_AFTER_BUILD = 0.1
 
 HEADERS = {"User-Agent": "kirapo-jyashin-rss/1.0 (+https://github.com/)"}
@@ -42,6 +46,8 @@ TIMEOUT = 20
 PUBLIC_DIR = "public"
 ATOM_NAME = "atom.xml"
 RSS_NAME = "compat.xml"  # 互換用（RSS 2.0）
+
+ITEM_DATE_STORE = Path("data/item_dates.json")
 
 CHANNEL_TITLE = "邪神ちゃんドロップキック"
 CHANNEL_SUBTITLE = "邪神ちゃんドロップキック 最新話（非公式Atom） | 出典: https://kirapo.jp/"
@@ -58,6 +64,8 @@ FEEDS = [
         "channel_title": "邪神ちゃんドロップキック",
         "channel_subtitle": "邪神ちゃんドロップキック 最新話（非公式Atom） | 出典: https://kirapo.jp/",
         "atom_name": "atom-jyashin.xml",
+        # Drop Feeds 等のRSSクライアント向け互換出力
+        "rss_name": "compat-jyashin.xml",
         "title_pages": [
             "https://kirapo.jp/meteor/titles/jyashin",
         ],
@@ -83,6 +91,27 @@ FEEDS = [
 # =====================
 
 DATE_JA_RE = re.compile(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日")
+DATE_SLASH_RE = re.compile(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})")
+
+DETAIL_DATETIME_CACHE: Dict[str, Optional[datetime]] = {}
+_CACHE_MISS = object()
+
+DETAIL_DATETIME_META_ATTRS = (
+    ("property", "article:modified_time"),
+    ("property", "article:published_time"),
+    ("property", "og:updated_time"),
+    ("property", "og:published_time"),
+    ("name", "pubdate"),
+    ("name", "lastmod"),
+    ("name", "last-modified"),
+    ("name", "created"),
+    ("name", "updated"),
+    ("name", "date"),
+    ("itemprop", "dateModified"),
+    ("itemprop", "datePublished"),
+)
+
+
 CHAPTER_LINE_RE = re.compile(r"^第\s*\d+\s*話[^\n]*")        # 行頭「第◯◯話 …」
 CHAPTER_IN_TEXT_RE = re.compile(r"第\s*\d+\s*話[^\n　]*")    # aテキスト内「第◯◯話 …」
 CH_NO_RE = re.compile(r"第\s*(\d+)\s*話")                   # 章番号
@@ -112,13 +141,85 @@ def get_soup(session: requests.Session, url: str) -> BeautifulSoup:
     return BeautifulSoup(r.text, "html.parser")
 
 
-def parse_site_date_anywhere(txt: str, default_dt: datetime) -> datetime:
+def parse_site_date_optional(txt: str) -> Optional[datetime]:
     m = DATE_JA_RE.search(txt)
-    if not m:
-        return default_dt
-    y, mo, d = map(int, m.groups())
-    return datetime(y, mo, d, 0, 0, 0, tzinfo=TZ_JST)
+    if m:
+        y, mo, d = map(int, m.groups())
+        return normalize_story_datetime(datetime(y, mo, d, 0, 0, 0, tzinfo=TZ_JST))
+    m = DATE_SLASH_RE.search(txt)
+    if m:
+        y, mo, d = map(int, m.groups())
+        return normalize_story_datetime(datetime(y, mo, d, 0, 0, 0, tzinfo=TZ_JST))
+    return None
 
+
+def parse_site_date_anywhere(txt: str, default_dt: datetime) -> datetime:
+    dt = parse_site_date_optional(txt)
+    if dt is not None:
+        return dt
+    return normalize_story_datetime(default_dt)
+
+
+def normalize_story_datetime(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TZ_JST)
+    else:
+        dt = dt.astimezone(TZ_JST)
+    if dt.hour == 0 and dt.minute == 0 and dt.second == 0:
+        dt = dt.replace(hour=9)
+    return dt.replace(microsecond=0)
+
+
+
+def ensure_unique_utc(dt: datetime, seen: Dict[datetime, int]) -> datetime:
+    base = dt.astimezone(tz.gettz("UTC"))
+    count = seen.get(base)
+    if count is None:
+        seen[base] = 1
+        return base
+    adjusted = base + timedelta(minutes=count)
+    seen[base] = count + 1
+    return adjusted
+
+def parse_iso_datetime(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    try:
+        dt = isoparse(cleaned)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TZ_JST)
+    else:
+        dt = dt.astimezone(TZ_JST)
+    return normalize_story_datetime(dt)
+
+
+def load_item_dates() -> Dict[str, datetime]:
+    store: Dict[str, datetime] = {}
+    if not ITEM_DATE_STORE.exists():
+        return store
+    try:
+        raw = json.loads(ITEM_DATE_STORE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"[warn] item date store load failed: {exc}")
+        return store
+    for link, value in raw.items():
+        dt = parse_iso_datetime(value) if isinstance(value, str) else None
+        if dt:
+            store[link] = dt
+    return store
+
+def save_item_dates(store: Dict[str, datetime]) -> None:
+    ITEM_DATE_STORE.parent.mkdir(parents=True, exist_ok=True)
+    payload = {k: v.astimezone(TZ_JST).isoformat() for k, v in store.items()}
+    try:
+        ITEM_DATE_STORE.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+    except Exception as exc:
+        print(f"[warn] item date store write failed: {exc}")
 
 def pick_chapter_lines(txt: str) -> List[str]:
     lines = []
@@ -127,6 +228,34 @@ def pick_chapter_lines(txt: str) -> List[str]:
             lines.append(line.strip())
     return lines
 
+
+def is_special_title(title: str) -> bool:
+    t = title or ""
+    keywords = (
+        "\u7279\u5225\u7de8",
+        "\u7279\u5225",
+        "\u30b9\u30da\u30b7\u30e3\u30eb",
+        "\u756a\u5916",
+        "\u90aa\u30d5\u30a7\u30b9",
+    )
+    return any(key in t for key in keywords)
+
+
+def pick_special_title_from_text(text: str) -> Optional[str]:
+    if not text:
+        return None
+    text = text.replace("\\n", "\n")
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line in ("読む", "読んだ", "最新話はこちら"):
+            continue
+        if any(noise in line for noise in NOISE_WORDS):
+            continue
+        if is_special_title(line):
+            return line
+    return None
 
 def normalize_chapter_title(raw: str) -> str:
     s = raw.strip()
@@ -138,10 +267,68 @@ def normalize_chapter_title(raw: str) -> str:
     return s.strip()
 
 
+
+def extract_detail_datetime(session: requests.Session, link: str, fallback_dt: datetime) -> datetime:
+    cached = DETAIL_DATETIME_CACHE.get(link, _CACHE_MISS)
+    if cached is not _CACHE_MISS:
+        return cached or fallback_dt
+
+    try:
+        soup = get_soup(session, link)
+        time.sleep(DELAY_DETAIL_PAGE)
+    except Exception as exc:
+        print(f"[warn] detail fetch failed {link}: {exc}")
+        DETAIL_DATETIME_CACHE[link] = None
+        return fallback_dt
+
+    dt = None
+
+    for attr_name, attr_value in DETAIL_DATETIME_META_ATTRS:
+        meta = soup.find("meta", attrs={attr_name: attr_value})
+        if meta and meta.get("content"):
+            dt = parse_iso_datetime(meta["content"])
+            if dt:
+                break
+
+    if not dt:
+        for time_tag in soup.find_all("time"):
+            candidates = [
+                time_tag.get("datetime"),
+                time_tag.get("data-time"),
+                time_tag.get("data-updated"),
+            ]
+            for cand in candidates:
+                parsed = parse_iso_datetime(cand) if cand else None
+                if parsed:
+                    dt = parsed
+                    break
+            if dt:
+                break
+            text = time_tag.get_text(" ", strip=True)
+            parsed_text = parse_site_date_optional(text)
+            if parsed_text:
+                dt = parsed_text
+                break
+
+    if not dt:
+        text = soup.get_text("\n", strip=True)
+        dt = parse_site_date_optional(text)
+
+    if dt:
+        DETAIL_DATETIME_CACHE[link] = dt
+        return dt
+
+    DETAIL_DATETIME_CACHE[link] = None
+    return fallback_dt
+
+
+
 def extract_items_from_title_page(
+    session: requests.Session,
     soup: BeautifulSoup,
     title_url: str,
     view_prefix: str,
+    stored_dates: Dict[str, datetime],
     now: datetime,
 ) -> List[Tuple[datetime, str, str, str]]:
     txt = soup.get_text("\n", strip=True)
@@ -159,7 +346,7 @@ def extract_items_from_title_page(
                 anchors.append((a, full))
 
     if not anchors:
-        a_latest = soup.find("a", string=re.compile("最新話を読む"))
+        a_latest = soup.find("a", string=re.compile("最新話はこちら"))
         if a_latest and a_latest.get("href"):
             full = urljoin(BASE, a_latest["href"])
             anchors.append((a_latest, full))
@@ -175,10 +362,12 @@ def extract_items_from_title_page(
     if not anchors:
         return []
 
-    items = []
+    items: List[Tuple[datetime, str, str, str]] = []
     seen_titles = set()
     count = min(MAX_ITEMS, len(anchors))
     line_idx = 0
+    last_regular_dt: Optional[datetime] = None
+    first_item_special = False
 
     for i in range(count):
         a, link = anchors[i]
@@ -190,15 +379,18 @@ def extract_items_from_title_page(
         if not chapter_title:
             parent = a.parent
             hops = 0
-            while parent is not None and hops < 3 and not chapter_title:
-                t = parent.get_text(" ", strip=True)
-                m2 = CHAPTER_IN_TEXT_RE.search(t or "")
-                if m2:
-                    chapter_title = m2.group(0).strip()
-                    break
+            while parent is not None and hops < 5 and not chapter_title:
+                t = parent.get_text("\n", strip=True)
+                if t:
+                    special_candidate = pick_special_title_from_text(t)
+                    if special_candidate:
+                        chapter_title = special_candidate
+                        break
+                    m2 = CHAPTER_IN_TEXT_RE.search(t)
+                    if m2:
+                        chapter_title = m2.group(0).strip()
                 parent = parent.parent
                 hops += 1
-
         if not chapter_title and line_idx < len(chapter_lines):
             chapter_title = chapter_lines[line_idx]
             line_idx += 1
@@ -215,8 +407,40 @@ def extract_items_from_title_page(
             continue
         seen_titles.add(chapter_title)
 
+        is_regular = bool(CH_NO_RE.search(chapter_title))
+        is_special = is_special_title(chapter_title)
+        if i == 0:
+            first_item_special = is_special
+
+        cached_dt = stored_dates.get(link)
+
+        if cached_dt:
+            item_dt = normalize_story_datetime(cached_dt)
+        else:
+            item_dt = normalize_story_datetime(extract_detail_datetime(session, link, base_dt))
+            if item_dt.date() > base_dt.date():
+                item_dt = base_dt
+
+            if is_regular:
+                if last_regular_dt is not None:
+                    expected_dt = last_regular_dt - timedelta(days=14)
+                else:
+                    expected_dt = base_dt - timedelta(days=14) if first_item_special else base_dt
+                if item_dt.date() > expected_dt.date():
+                    item_dt = expected_dt
+            else:
+                if item_dt.date() > base_dt.date():
+                    item_dt = base_dt
+
+            item_dt = normalize_story_datetime(item_dt)
+
+        stored_dates[link] = item_dt
+
+        if is_regular:
+            last_regular_dt = item_dt
+
         body_html = f'<p><a href="{link}">{chapter_title}</a></p>'
-        items.append((base_dt, chapter_title, link, body_html))
+        items.append((item_dt, chapter_title, link, body_html))
 
     return items
 
@@ -244,14 +468,14 @@ def write_atom(
     fa.language("ja")
     fa.updated(now.astimezone(tz.gettz("UTC")))
 
-    # Atom entry を古→新の順で +1分ずつ updated を進める
-    for idx, (dt, item_title, link, body_html) in enumerate(items):
+    seen_updated: Dict[datetime, int] = {}
+    for dt, item_title, link, body_html in items:
         ent = fa.add_entry()
         ent.id(link)
         ent.title(item_title)
         ent.link(href=link)
-        ent.updated((dt + timedelta(minutes=idx)).astimezone(tz.gettz("UTC")))
-        ent.content(body_html + '<br>出典: <a href="https://kirapo.jp/">きら星ポータル</a>', type='html')
+        ent.updated(ensure_unique_utc(dt, seen_updated))
+        ent.content(body_html + '<br>出典: <a href="https://kirapo.jp/">キラポポータル</a>', type='html')
 
     fa.atom_file(os.path.join(PUBLIC_DIR, atom_name))
 
@@ -282,16 +506,15 @@ def write_rss(
     # RSS 2.0 では lastBuildDate を設定
     fr.lastBuildDate(now.astimezone(tz.gettz("UTC")))
 
-    for idx, (dt, item_title, link, body_html) in enumerate(items):
+    seen_pubdates: Dict[datetime, int] = {}
+    for dt, item_title, link, body_html in items:
         ent = fr.add_entry()
-        # RSS 2.0 では guid を明示、permalink を true に
+        # RSS 2.0 では guid を明示的に permalink=true で設定
         ent.guid(link, permalink=True)
         ent.title(item_title)
         ent.link(href=link)
-        # RSS 2.0 では pubDate を使用
-        ent.pubDate((dt + timedelta(minutes=idx)).astimezone(tz.gettz("UTC")))
-        # RSS 2.0 は description を使用（HTML許容）
-        ent.description(body_html + '<br>出典: <a href="https://kirapo.jp/">きら星ポータル</a>')
+        ent.pubDate(ensure_unique_utc(dt, seen_pubdates))
+        ent.description(body_html + '<br>出典: <a href="https://kirapo.jp/">キラポポータル</a>')
 
     fr.rss_file(os.path.join(PUBLIC_DIR, rss_name))
 
@@ -337,6 +560,7 @@ def collect_items_for(
     session: requests.Session,
     title_pages: List[str],
     view_prefix_map: dict,
+    stored_dates: Dict[str, datetime],
     now: datetime,
 ) -> List[Tuple[datetime, str, str, str]]:
     """指定のタイトルページ群からアイテムを収集し、章番号で昇順に整列。"""
@@ -353,7 +577,7 @@ def collect_items_for(
                 else:
                     print(f"[warn] VIEW_PREFIX not found for {title_url}")
                     continue
-            items = extract_items_from_title_page(soup, title_url, view_prefix, now)
+            items = extract_items_from_title_page(session, soup, title_url, view_prefix, stored_dates, now)
             items_all.extend(items)
             time.sleep(DELAY_TITLE_PAGE)
         except Exception as e:
@@ -373,6 +597,8 @@ def collect_items_for(
 def main():
     now = datetime.now(tz=TZ_JST)
     session = make_session()
+    stored_dates = load_item_dates()
+
 
     all_items: List[Tuple[datetime, str, str, str]] = []
 
@@ -389,7 +615,7 @@ def main():
                     print(f"[warn] VIEW_PREFIX not found for {title_url}")
                     continue
 
-            items = extract_items_from_title_page(soup, title_url, view_prefix, now)
+            items = extract_items_from_title_page(session, soup, title_url, view_prefix, stored_dates, now)
             all_items.extend(items)
             time.sleep(DELAY_TITLE_PAGE)
         except Exception as e:
@@ -416,6 +642,7 @@ def main():
             session=session,
             title_pages=feed.get("title_pages", []),
             view_prefix_map=feed.get("view_prefix_map", {}),
+            stored_dates=stored_dates,
             now=now,
         )
         if not items:
@@ -460,5 +687,6 @@ def main():
         print(f"OK: generated {len(generated)} feed(s) -> feeds.html list")
 
 
+    save_item_dates(stored_dates)
 if __name__ == "__main__":
     main()
