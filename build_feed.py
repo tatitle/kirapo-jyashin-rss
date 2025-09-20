@@ -10,16 +10,18 @@ import re
 import time
 import json
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
-from urllib.parse import urljoin
 from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple, cast
+from urllib.parse import urljoin
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
+from bs4.element import NavigableString
 from dateutil import tz
 from dateutil.parser import isoparse
 from feedgen.feed import FeedGenerator
-from requests.adapters import HTTPAdapter, Retry
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ======= 設定 =======
 
@@ -94,7 +96,7 @@ DATE_JA_RE = re.compile(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日")
 DATE_SLASH_RE = re.compile(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})")
 
 DETAIL_DATETIME_CACHE: Dict[str, Optional[datetime]] = {}
-_CACHE_MISS = object()
+_CACHE_MISS: object = object()
 
 DETAIL_DATETIME_META_ATTRS = (
     ("property", "article:modified_time"),
@@ -271,7 +273,8 @@ def normalize_chapter_title(raw: str) -> str:
 def extract_detail_datetime(session: requests.Session, link: str, fallback_dt: datetime) -> datetime:
     cached = DETAIL_DATETIME_CACHE.get(link, _CACHE_MISS)
     if cached is not _CACHE_MISS:
-        return cached or fallback_dt
+        resolved = cast(Optional[datetime], cached)
+        return resolved or fallback_dt
 
     try:
         soup = get_soup(session, link)
@@ -285,23 +288,28 @@ def extract_detail_datetime(session: requests.Session, link: str, fallback_dt: d
 
     for attr_name, attr_value in DETAIL_DATETIME_META_ATTRS:
         meta = soup.find("meta", attrs={attr_name: attr_value})
-        if meta and meta.get("content"):
-            dt = parse_iso_datetime(meta["content"])
-            if dt:
-                break
+        if isinstance(meta, Tag):
+            content = meta.get("content")
+            if isinstance(content, str):
+                dt = parse_iso_datetime(content)
+                if dt:
+                    break
 
     if not dt:
         for time_tag in soup.find_all("time"):
+            if not isinstance(time_tag, Tag):
+                continue
             candidates = [
                 time_tag.get("datetime"),
                 time_tag.get("data-time"),
                 time_tag.get("data-updated"),
             ]
             for cand in candidates:
-                parsed = parse_iso_datetime(cand) if cand else None
-                if parsed:
-                    dt = parsed
-                    break
+                if isinstance(cand, str):
+                    parsed = parse_iso_datetime(cand)
+                    if parsed:
+                        dt = parsed
+                        break
             if dt:
                 break
             text = time_tag.get_text(" ", strip=True)
@@ -335,29 +343,38 @@ def extract_items_from_title_page(
     base_dt = parse_site_date_anywhere(txt, default_dt=now)
     chapter_lines = pick_chapter_lines(txt)
 
-    anchors = []
-    seen = set()
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if view_prefix in href:
-            full = urljoin(BASE, href)
+    anchors: List[Tuple[Tag, str]] = []
+    seen: Set[str] = set()
+    for candidate in soup.find_all("a", href=True):
+        if not isinstance(candidate, Tag):
+            continue
+        href_value = candidate.get("href")
+        if isinstance(href_value, str) and view_prefix in href_value:
+            full = urljoin(BASE, href_value)
             if full not in seen:
                 seen.add(full)
-                anchors.append((a, full))
+                anchors.append((candidate, full))
 
     if not anchors:
         a_latest = soup.find("a", string=re.compile("最新話はこちら"))
-        if a_latest and a_latest.get("href"):
-            full = urljoin(BASE, a_latest["href"])
-            anchors.append((a_latest, full))
+        if isinstance(a_latest, Tag):
+            href_value = a_latest.get("href")
+            if isinstance(href_value, str):
+                full = urljoin(BASE, href_value)
+                anchors.append((a_latest, full))
 
     if not anchors:
-        for a in soup.find_all("a", href=True):
-            if CHAPTER_IN_TEXT_RE.search(a.get_text(strip=True) or ""):
-                full = urljoin(BASE, a["href"])
-                if full not in seen:
-                    seen.add(full)
-                    anchors.append((a, full))
+        for candidate in soup.find_all("a", href=True):
+            if not isinstance(candidate, Tag):
+                continue
+            text_candidate = candidate.get_text(strip=True) or ""
+            if CHAPTER_IN_TEXT_RE.search(text_candidate):
+                href_value = candidate.get("href")
+                if isinstance(href_value, str):
+                    full = urljoin(BASE, href_value)
+                    if full not in seen:
+                        seen.add(full)
+                        anchors.append((candidate, full))
 
     if not anchors:
         return []
@@ -380,16 +397,20 @@ def extract_items_from_title_page(
             parent = a.parent
             hops = 0
             while parent is not None and hops < 5 and not chapter_title:
-                t = parent.get_text("\n", strip=True)
-                if t:
-                    special_candidate = pick_special_title_from_text(t)
+                text_source = ""
+                if isinstance(parent, Tag):
+                    text_source = parent.get_text("\n", strip=True)
+                elif isinstance(parent, NavigableString):
+                    text_source = str(parent).strip()
+                if text_source:
+                    special_candidate = pick_special_title_from_text(text_source)
                     if special_candidate:
                         chapter_title = special_candidate
                         break
-                    m2 = CHAPTER_IN_TEXT_RE.search(t)
+                    m2 = CHAPTER_IN_TEXT_RE.search(text_source)
                     if m2:
                         chapter_title = m2.group(0).strip()
-                parent = parent.parent
+                parent = getattr(parent, 'parent', None)
                 hops += 1
         if not chapter_title and line_idx < len(chapter_lines):
             chapter_title = chapter_lines[line_idx]
